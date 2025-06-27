@@ -50,6 +50,10 @@ class JSONDataset(Dataset[Atoms]):
                 cell=np.array(entry["cell"]),
                 pbc=True,
             )
+            # Descriptors
+            for task_name in self.config.tasks.values():
+                if task_name in entry:
+                    atoms.info[task_name] = torch.tensor(entry[task_name])
 
             energy, forces, stress = None, None, None
             if "energy" in self.config.tasks:

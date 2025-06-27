@@ -3,8 +3,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import logging
-from collections.abc import Iterable
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Literal
 
 import nshconfig as C
 import numpy as np
@@ -26,6 +25,22 @@ if TYPE_CHECKING:
 
 
 log = logging.getLogger(__name__)
+
+import torch.nn as nn
+
+
+# Add the class just above or below ORBBackboneModule
+class GMPHead(nn.Module):
+    def __init__(self, input_dim: int = 256, output_dim: int = 10):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, output_dim),
+        )
+
+    def forward(self, node_features, batch=None):
+        return self.net(node_features)
 
 
 class ORBSystemConfig(C.Config):
@@ -105,10 +120,10 @@ class ORBBackboneModule(
     def _create_output_head(self, prop: props.PropertyConfig, pretrained_model):
         with optional_import_error_message("orb_models"):
             from orb_models.forcefield.forcefield_heads import (
-                EnergyHeadPoolAfter,
+                EnergyHead,
                 ForceHead,
+                GraphHead,
                 StressHead,
-                GraphHeadPoolAfter,
             )
 
         self.include_forces = False
@@ -118,7 +133,7 @@ class ORBBackboneModule(
                 if not self.hparams.reset_output_heads:
                     return pretrained_model.graph_head
                 else:
-                    return EnergyHeadPoolAfter(
+                    return EnergyHead(
                         latent_dim=256,
                         num_mlp_layers=1,
                         mlp_hidden_dim=256,
@@ -166,7 +181,7 @@ class ORBBackboneModule(
                         "Pretrained model does not support general graph properties, only energy, forces, and stresses are supported."
                     )
                 else:
-                    return GraphHeadPoolAfter(
+                    return GraphHead(
                         latent_dim=256,
                         num_mlp_layers=1,
                         mlp_hidden_dim=256,
@@ -175,8 +190,12 @@ class ORBBackboneModule(
                             dim=1,
                             domain="real",
                         ),
-                        node_aggregation=prop.reduction, # type: ignore[reportUnboundType] # noqa
+                        node_aggregation=prop.reduction,  # type: ignore[reportUnboundType] # noqa
                     )
+
+            case props.GMPPropertyConfig():
+                return GMPHead(input_dim=256, output_dim=10)
+
             case _:
                 raise ValueError(
                     f"Unsupported property config: {prop} for ORB"
@@ -187,8 +206,10 @@ class ORBBackboneModule(
     def create_model(self):
         with optional_import_error_message("orb_models"):
             from orb_models.forcefield import pretrained
+            from orb_models.forcefield.conservative_regressor import (
+                ConservativeForcefieldRegressor,
+            )
             from orb_models.forcefield.direct_regressor import DirectForcefieldRegressor
-            from orb_models.forcefield.conservative_regressor import ConservativeForcefieldRegressor
 
         # Get the pre-trained backbone
         # Load the pre-trained model from the ORB package
@@ -206,9 +227,9 @@ class ORBBackboneModule(
         assert pretrained_model is not None, "The pretrained model is not available"
 
         # This should be a `GraphRegressor` object, so we need to extract the backbone.
-        assert isinstance(pretrained_model, DirectForcefieldRegressor) or isinstance(pretrained_model, ConservativeForcefieldRegressor), (
-            f"Expected a GraphRegressor object, but got {type(pretrained_model)}"
-        )
+        assert isinstance(pretrained_model, DirectForcefieldRegressor) or isinstance(
+            pretrained_model, ConservativeForcefieldRegressor
+        ), f"Expected a GraphRegressor object, but got {type(pretrained_model)}"
         if isinstance(pretrained_model, DirectForcefieldRegressor):
             self.conservative = False
         else:
@@ -246,7 +267,7 @@ class ORBBackboneModule(
         for head in self.output_heads.values():
             if head is not None:
                 yield from head.named_parameters()
-                
+
     @override
     @contextlib.contextmanager
     def model_forward_context(self, data, mode: str):
@@ -265,16 +286,17 @@ class ORBBackboneModule(
             data.edge_features["vectors"] = vectors
             yield
 
-
     @override
     def model_forward(self, batch, mode: str, using_partition: bool = False):
         with optional_import_error_message("orb_models"):
-            from orb_models.forcefield.forcefield_utils import compute_gradient_forces_and_stress
-        
+            from orb_models.forcefield.forcefield_utils import (
+                compute_gradient_forces_and_stress,
+            )
+
         # Run the backbone
         out = self.backbone(batch)
         node_features = out["node_features"]
-        
+
         # Feed the backbone output to the output heads
         predicted_properties: dict[str, torch.Tensor] = {}
         for name, head in self.output_heads.items():
@@ -291,19 +313,19 @@ class ORBBackboneModule(
                 if isinstance(res, torch.Tensor):
                     predicted_properties[name] = res
                 elif isinstance(res, dict):
-                    if mode!="predict":
+                    if mode != "predict":
                         predicted_properties[name] = res[name]
                     else:
                         predicted_properties.update(res)
                 else:
-                    raise ValueError(
-                        f"Invalid output from head {head}: {res}"
-                    )
+                    raise ValueError(f"Invalid output from head {head}: {res}")
             else:
-                assert isinstance(prop, props.ForcesPropertyConfig) or isinstance(prop, props.StressesPropertyConfig), (
-                    f"Conservative Property {name} is not a force or stress property."
-                )
-                assert "energy" in predicted_properties, ("Energy property is not found for conservative property prediction. Please put energy property before the conservative property in the config.")
+                assert isinstance(prop, props.ForcesPropertyConfig) or isinstance(
+                    prop, props.StressesPropertyConfig
+                ), f"Conservative Property {name} is not a force or stress property."
+                assert (
+                    "energy" in predicted_properties
+                ), "Energy property is not found for conservative property prediction. Please put energy property before the conservative property in the config."
                 if name in predicted_properties:
                     pass
                 else:
@@ -319,14 +341,17 @@ class ORBBackboneModule(
                     if self.include_forces:
                         predicted_properties["forces"] = forces
                     if self.include_stress:
-                        predicted_properties["stresses"] = stress # type: ignore[reportUnboundType]
-        
-        if "stresses" in predicted_properties and predicted_properties["stress"].shape[1] == 6: # type: ignore[reportUnboundType]
+                        predicted_properties["stresses"] = stress  # type: ignore[reportUnboundType]
+
+        if (
+            "stresses" in predicted_properties
+            and predicted_properties["stress"].shape[1] == 6
+        ):  # type: ignore[reportUnboundType]
             # Convert the stress tensor to the full 3x3 form
             predicted_properties["stresses"] = voigt_6_to_full_3x3_stress_torch(
-                predicted_properties["stresses"] # type: ignore[reportUnboundType]
+                predicted_properties["stresses"]  # type: ignore[reportUnboundType]
             )
-            
+
         pred_dict: ModelOutput = {"predicted_properties": predicted_properties}
         return pred_dict
 
@@ -395,7 +420,7 @@ class ORBBackboneModule(
             system_config=self.system_config,
             device=self.device,
         )
-        
+
         if has_labels:
             if atom_graphs.system_targets is None:
                 atom_graphs = atom_graphs._replace(system_targets={})
@@ -424,7 +449,7 @@ class ORBBackboneModule(
                             value.reshape(1, 1) if value.dim() == 0 else value
                         )
                     case "atom":
-                        atom_graphs.node_targets[prop.name] = value # type: ignore[reportUnboundType]
+                        atom_graphs.node_targets[prop.name] = value  # type: ignore[reportUnboundType]
                     case _:
                         assert_never(prop_type)
 
@@ -442,13 +467,13 @@ class ORBBackboneModule(
         atom_graphs.system_features["norm_composition"] = composition
 
         return atom_graphs
-    
+
     @override
     def get_connectivity_from_data(self, data: AtomGraphs) -> torch.Tensor:
         senders = data.senders.clone()
         receivers = data.receivers.clone()
         return torch.stack([senders, receivers], dim=0)
-    
+
     @override
     def get_connectivity_from_atoms(self, atoms) -> np.ndarray:
         data = self.atoms_to_data(atoms, has_labels=False)
@@ -463,9 +488,9 @@ class ORBBackboneModule(
             raise ValueError("No composition found in the batch.")
         compositions = compositions[:, 1:]  # Remove the zeroth element
         return NormalizationContext(num_atoms=num_atoms, compositions=compositions)
-    
+
     @override
-    def apply_early_stop_message_passing(self, message_passing_steps: int|None):
+    def apply_early_stop_message_passing(self, message_passing_steps: int | None):
         """
         Apply message passing for early stopping.
         """

@@ -1,12 +1,10 @@
-__codegen__ = True
+from __future__ import annotations
 
-from mattertune.recipes.base import RecipeConfigBase as RecipeConfigBase
+__codegen__ = True
 
 from mattertune.recipes.base import RecipeConfig as RecipeConfig
 from mattertune.recipes.base import RecipeConfigBase as RecipeConfigBase
-
 from mattertune.recipes.base import recipe_registry as recipe_registry
-
 
 __all__ = [
     "RecipeConfig",

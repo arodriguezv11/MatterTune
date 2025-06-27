@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from functools import partial
 from typing import TYPE_CHECKING
 
 import ase
@@ -12,6 +13,12 @@ from .data_util import IterableDatasetWrapper, MapDatasetWrapper
 
 if TYPE_CHECKING:
     from .base import FinetuneModuleBase, TBatch, TData, TFinetuneModuleConfig
+
+
+def _default_map_fn(ase_data: ase.Atoms, lightning_module, has_labels):
+    data = lightning_module.atoms_to_data(ase_data, has_labels)
+    data = lightning_module.cpu_data_transform(data)
+    return data
 
 
 class DataLoaderKwargs(TypedDict, total=False):
@@ -67,10 +74,13 @@ def create_dataloader(
     lightning_module: FinetuneModuleBase[TData, TBatch, TFinetuneModuleConfig],
     **kwargs: Unpack[DataLoaderKwargs],
 ):
-    def map_fn(ase_data: ase.Atoms):
-        data = lightning_module.atoms_to_data(ase_data, has_labels)
-        data = lightning_module.cpu_data_transform(data)
-        return data
+    # def map_fn(ase_data: ase.Atoms):
+    #     data = lightning_module.atoms_to_data(ase_data, has_labels)
+    #     data = lightning_module.cpu_data_transform(data)
+    #     return data
+    map_fn = partial(
+        _default_map_fn, lightning_module=lightning_module, has_labels=has_labels
+    )
 
     # Wrap the dataset with the CPU data transform
     dataset_mapped = (

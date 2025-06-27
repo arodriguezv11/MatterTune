@@ -241,13 +241,38 @@ class StressesPropertyConfig(PropertyConfigBase):
         return "system"
 
 
+class GMPPropertyConfig(PropertyConfigBase):
+    type: Literal["GMP"] = "GMP"
+
+    dtype: DType = "float"
+
+    conservative: bool = False
+
+    @override
+    def from_ase_atoms(self, atoms: Atoms) -> np.ndarray:
+        """
+        This assumes that atoms.info['GMP'] contains a numpy array of shape [num_atoms, descriptor_dim].
+        You must load the dataset so that this key is populated correctly.
+        """
+        return atoms.info[self.name]
+
+    @override
+    def ase_calculator_property_name(self) -> None:
+        return None  # Not computed via ASE calculators
+
+    @override
+    def property_type(self) -> Literal["atom"]:
+        return "atom"
+
+
 PropertyConfig = TypeAliasType(
     "PropertyConfig",
     Annotated[
         GraphPropertyConfig
         | EnergyPropertyConfig
         | ForcesPropertyConfig
-        | StressesPropertyConfig,
+        | StressesPropertyConfig
+        | GMPPropertyConfig,
         C.Field(
             description="The configuration for the property.",
             discriminator="type",
